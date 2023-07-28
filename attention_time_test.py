@@ -1,7 +1,7 @@
 import torch
 import einops
 import time
-from model import DilatedAttention
+from longnet.model_old import DilatedAttention
 
 class MultiHeadAttention(torch.nn.Module):
     def __init__(self, dim, n_heads):

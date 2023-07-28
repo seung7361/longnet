@@ -1,5 +1,5 @@
 import torch
-from model import Decoder
+from longnet.model_old import Decoder
 from transformers import AutoTokenizer
 from datasets import load_dataset
 from tqdm import tqdm

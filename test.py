@@ -1,32 +1,63 @@
 import torch
-from model import DilatedAttention
-from transformers import AutoTokenizer
+import einops
+from model import MultiHeadDilatedAttention
+import time
 
-### hyperparameter
+class MultiHeadAttention(torch.nn.Module):
+    def __init__(self, dim, n_heads):
+        super().__init__()
 
-max_len = 4096
+        self.dim = dim
+        self.n_heads = n_heads
 
-tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b", eos_token='</s>', pad_token='<pad>', model_max_length=max_len)
-vocab_size = tokenizer.vocab_size + 3
-n_layers = 12
-n_heads = 16
-dim = 1024
-f_dim = 4096
+        self.query = torch.nn.Linear(dim, dim)
+        self.key = torch.nn.Linear(dim, dim)
+        self.value = torch.nn.Linear(dim, dim)
 
-num_epochs = 5
-batch_size = 32
-learning_rate = 1e-4
-weight_decay = 1e-2
+        self.out = torch.nn.Linear(dim, dim)
+    
+    def forward(self, Q, K, V):
+        B, T, d = Q.shape
 
-model = DilatedAttention(dim, n_heads, max_len).cuda()
+        Q, K, V = self.query(Q), self.key(K), self.value(V)
 
-# example_sentence = "</s> The quick brown fox jumps over the lazy dog. </s>"
-# input_ids = tokenizer(example_sentence, padding='max_length',
-#                       max_length=max_len, truncation=True, return_tensors='pt').input_ids.long().unsqueeze(0).cuda()
+        Q = einops.rearrange(Q, "B T (n d) -> B n T d", n=self.n_heads)
+        K = einops.rearrange(K, "B T (n d) -> B n T d", n=self.n_heads)
+        V = einops.rearrange(V, "B T (n d) -> B n T d", n=self.n_heads)
 
-x = torch.randn(batch_size, max_len, dim).cuda()
-with torch.autograd.profiler.profile(use_cuda=True) as prof:
-    y = model(x)
+        out = torch.einsum("b n t d, b n s d -> b n t s", Q, K) / (d ** 0.5)
+        mask = torch.tril(torch.ones(T, T)).cuda()
+        out = out.masked_fill(mask == 0, float('-inf'))
+        out = torch.nn.functional.softmax(out, dim=-1)
 
-print(prof.key_averages().table(sort_by="cuda_time_total"))
-print(y.shape)
+        out = torch.einsum("b n t s, b n s d -> b n t d", out, V)
+        out = einops.rearrange(out, "B n T d -> B T (n d)")
+
+        out = self.out(out)
+
+        return out
+
+B, T, d = 16, 4096, 1024
+n_heads = 8
+
+rates = [0, 1, 2, 3, 4, 5, 6, 7]
+attn1 = MultiHeadDilatedAttention(d, n_heads, rates).cuda() # 4.5GiB
+attn2 = MultiHeadAttention(d, n_heads).cuda() # 27GiB
+
+X = torch.randn(B, T, d).cuda()
+
+start = time.time()
+
+out = attn1(X, X, X)
+print(out.shape)
+
+end1 = time.time()
+print(f"Time taken: {end1 - start:.3f} seconds")
+
+# out = attn2(X, X, X)
+# print(out.shape)
+
+end2 = time.time()
+print(f"Time taken: {end2 - end1:.3f} seconds")
+
+time.sleep(10)
