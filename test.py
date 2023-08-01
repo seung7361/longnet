@@ -37,11 +37,12 @@ class MultiHeadAttention(torch.nn.Module):
 
         return out
 
-B, T, d = 16, 4096, 1024
-n_heads = 8
+B, T, d = 16, 17, 1024
+n_heads = 16
 
-rates = [0, 1, 2, 3, 4, 5, 6, 7]
-attn1 = MultiHeadDilatedAttention(d, n_heads, rates).cuda() # 4.5GiB
+segment_lengths = [4, 8]
+dilated_rates = [1, 2]
+attn1 = MultiHeadDilatedAttention(d, n_heads, segment_lengths, dilated_rates).cuda() # 4.5GiB
 attn2 = MultiHeadAttention(d, n_heads).cuda() # 27GiB
 
 X = torch.randn(B, T, d).cuda()

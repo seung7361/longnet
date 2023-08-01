@@ -1,26 +1,27 @@
 import torch
 import einops
 import xformers.ops
+import torchscale.component.xpos_relative_position
 
-from typing import List, Tuple
+from typing import Tuple, List
 
 class DilatedAttention(torch.nn.Module):
-    def __init__(self, dim, n_heads, rates: List[int]) -> None:
+    def __init__(self, dim, n_heads, segment_lengths: List[int], dilated_rates: List[int]) -> None:
         super().__init__()
 
         self.dim = dim
         self.n_heads = n_heads
-        self.rates = rates
+        self.segment_lengths = segment_lengths
+        self.dilated_rates = dilated_rates
+
+        assert len(segment_lengths) == len(dilated_rates)
     
     def forward(self, Q, K, V):
         # Q, K, V: (B, n, T, d)
         B, n, T, d = Q.shape
         out = torch.zeros_like(Q)
 
-        for i, rate in enumerate(self.rates):
-            segment_length = 2 ** (rate + 2)
-            dilated_rate = 2 ** rate
-
+        for segment_length, dilated_rate in zip(self.segment_lengths, self.dilated_rates):
             # B: batch size, n: number of heads, d: head dimension
             # L: number of segments, S: segment size
             Q = einops.rearrange(Q, "B n (L S) d -> B n L S d", S=segment_length)
@@ -34,7 +35,7 @@ class DilatedAttention(torch.nn.Module):
             # shift for each head
             for head in range(n):
                 offset = head % dilated_rate
-
+                
                 Q_offset[:, head, :, :, :] = Q[:, head, offset::dilated_rate, :, :]
                 K_offset[:, head, :, :, :] = K[:, head, offset::dilated_rate, :, :]
                 V_offset[:, head, :, :, :] = V[:, head, offset::dilated_rate, :, :]
@@ -67,22 +68,23 @@ class DilatedAttention(torch.nn.Module):
             K = einops.rearrange(K, "B n L S d -> B n (L S) d", S=segment_length)
             V = einops.rearrange(V, "B n L S d -> B n (L S) d", S=segment_length)
     
-        return out / len(self.rates)
+        return out / len(self.dilated_rates)
 
 
 class MultiHeadDilatedAttention(torch.nn.Module):
-    def __init__(self, dim, n_heads, rate: List[int]) -> None:
+    def __init__(self, dim, n_heads, segment_lengths: List[int], dilated_rates: List[int]) -> None:
         super().__init__()
 
         self.dim = dim
         self.n_heads = n_heads
-        self.rate = rate
+        self.segment_lengths = segment_lengths
+        self.dilated_rates = dilated_rates
 
         self.query = torch.nn.Linear(dim, dim)
         self.key = torch.nn.Linear(dim, dim)
         self.value = torch.nn.Linear(dim, dim)
 
-        self.attention = DilatedAttention(dim, n_heads, rate)
+        self.attention = DilatedAttention(dim, n_heads, segment_lengths, dilated_rates)
 
         self.out = torch.nn.Linear(dim, dim)
     
@@ -101,3 +103,59 @@ class MultiHeadDilatedAttention(torch.nn.Module):
         x = self.out(x)
 
         return x
+
+class LongNetLayer(torch.nn.Module):
+    def __init__(self, dim, n_heads, segment_lengths: List[int], dilated_rates: List[int]) -> None:
+        super().__init__()
+
+        self.dim = dim
+        self.n_heads = n_heads
+        self.segment_lengths = segment_lengths
+        self.dilated_rates = dilated_rates
+
+        self.attn = MultiHeadDilatedAttention(dim, n_heads, segment_lengths, dilated_rates)
+        self.lm1 = torch.nn.LayerNorm(dim)
+        self.lm2 = torch.nn.LayerNorm(dim)
+
+        self.mlp = torch.nn.Sequential(
+            torch.nn.Linear(dim, dim * 4),
+            torch.nn.GELU(),
+            torch.nn.Linear(dim * 4, dim)
+        )
+        
+    def forward(self, x):
+        x_ = self.attn(x, x, x)
+        x = self.lm1(x + x_)
+
+        x_ = self.mlp(x)
+        x = self.lm2(x + x_)
+
+        return x
+
+class LongNet(torch.nn.Module):
+    def __init__(
+            self,
+            vocab_size: int,
+            dim: int,
+            n_heads: int,
+            segment_lengths: List[int],
+            dilated_rates: List[int],
+            n_layers: int
+        ) -> None:
+        super().__init__()
+
+        self.dim = dim
+        self.n_heads = n_heads
+        self.segment_lengths = segment_lengths
+        self.dilated_rates = dilated_rates
+
+        self.emb = torch.nn.Embedding(vocab_size, dim)
+        self.pos_emb = torchscale.component.xpos_relative_position(dim)
+
+        self.layers = torch.nn.ModuleList([
+            LongNetLayer(dim, n_heads, segment_lengths, dilated_rates)
+            for _ in range(n_layers)
+        ])
+    
+    def forward(self, x):
+        self.pos_emb = self.pos_emb.to(x.device)
